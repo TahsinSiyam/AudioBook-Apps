@@ -1,0 +1,192 @@
+"""
+AdMob Ad Manager
+Handles Banner Ads, Interstitial (Video) Ads
+Uses KivyAds / native Android AdMob SDK via pyjnius
+"""
+
+from kivy.utils import platform
+from kivy.logger import Logger
+
+# ─── TEST AD UNIT IDs (Replace with your real ones before publishing) ──────────
+ADMOB_APP_ID          = "ca-app-pub-2897970554214470~6328839892"  # Test App ID
+BANNER_AD_UNIT_ID     = "ca-app-pub-2897970554214470/1779220795"  # Test Banner
+INTERSTITIAL_AD_UNIT  = "ca-app-pub-2897970554214470/8153057450"  # Test Interstitial
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+class AdMobManager:
+    """
+    Manages all AdMob ad types for the app.
+    On non-Android platforms, all methods are no-ops so the app
+    runs normally on desktop for development.
+    """
+
+    def __init__(self):
+        self._interstitial = None
+        self._banner = None
+        self._initialized = False
+
+    def initialize(self):
+        if platform != "android":
+            Logger.info("AdMob: Skipping init — not on Android")
+            return
+        try:
+            self._init_android_ads()
+            self._initialized = True
+            Logger.info("AdMob: Initialized successfully")
+        except Exception as e:
+            Logger.error(f"AdMob: Initialization failed — {e}")
+
+    # ── Android Native Init ────────────────────────────────────────────────────
+    def _init_android_ads(self):
+        """
+        Uses pyjnius to call the Android AdMob SDK.
+        The MobileAds.initialize() must be called before loading any ads.
+        """
+        from jnius import autoclass, cast
+        from android import activity as android_activity
+
+        MobileAds = autoclass("com.google.android.gms.ads.MobileAds")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        context = cast("android.content.Context", PythonActivity.mActivity)
+        MobileAds.initialize(context)
+
+        # Pre-load an interstitial ad so it's ready when needed
+        self._preload_interstitial()
+
+    # ── Banner Ad ──────────────────────────────────────────────────────────────
+    def create_banner_ad(self):
+        """
+        Creates and returns a native Android banner AdView.
+        Must be embedded into the layout using AndroidBannerWidget (see ui/widgets.py).
+        """
+        if platform != "android" or not self._initialized:
+            return None
+        try:
+            from jnius import autoclass, cast
+            AdView        = autoclass("com.google.android.gms.ads.AdView")
+            AdRequest     = autoclass("com.google.android.gms.ads.AdRequest")
+            AdSize        = autoclass("com.google.android.gms.ads.AdSize")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            context = cast("android.content.Context", PythonActivity.mActivity)
+
+            ad_view = AdView(context)
+            ad_view.setAdSize(AdSize.BANNER)
+            ad_view.setAdUnitId(BANNER_AD_UNIT_ID)
+
+            builder = AdRequest.Builder()
+            ad_view.loadAd(builder.build())
+            self._banner = ad_view
+            return ad_view
+        except Exception as e:
+            Logger.error(f"AdMob Banner: {e}")
+            return None
+
+    # ── Interstitial Ad (shown as "video ad" to users) ─────────────────────────
+    def _preload_interstitial(self):
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass, cast
+            InterstitialAd     = autoclass("com.google.android.gms.ads.interstitial.InterstitialAd")
+            AdRequest          = autoclass("com.google.android.gms.ads.AdRequest")
+            AdRequestBuilder   = autoclass("com.google.android.gms.ads.AdRequest$Builder")
+            PythonActivity     = autoclass("org.kivy.android.PythonActivity")
+            context = cast("android.content.Context", PythonActivity.mActivity)
+
+            request = AdRequestBuilder().build()
+            # Modern AdMob API uses static load method
+            InterstitialAd.load(
+                context,
+                INTERSTITIAL_AD_UNIT,
+                request,
+                _InterstitialCallback(self)
+            )
+        except Exception as e:
+            Logger.error(f"AdMob Interstitial preload: {e}")
+
+    def show_interstitial_ad(self, on_dismissed=None):
+        """Show the pre-loaded interstitial ad. Reloads after dismissal."""
+        if platform != "android":
+            Logger.info("AdMob: [DEV] Interstitial ad would show here")
+            if on_dismissed:
+                on_dismissed()
+            return
+
+        if self._interstitial:
+            try:
+                from jnius import autoclass, cast
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                activity = PythonActivity.mActivity
+                self._interstitial.setFullScreenContentCallback(
+                    _FullScreenCallback(self, on_dismissed)
+                )
+                self._interstitial.show(activity)
+                self._interstitial = None  # consumed
+                # Pre-load next
+                self._preload_interstitial()
+            except Exception as e:
+                Logger.error(f"AdMob show interstitial: {e}")
+                if on_dismissed:
+                    on_dismissed()
+        else:
+            Logger.warning("AdMob: Interstitial not ready yet")
+            if on_dismissed:
+                on_dismissed()
+
+    def set_interstitial(self, ad):
+        """Called by the callback when ad finishes loading."""
+        self._interstitial = ad
+
+
+# ── pyjnius Java Callback Stubs ────────────────────────────────────────────────
+# These are only instantiated on Android. They bridge Java callbacks → Python.
+
+if platform == "android":
+    try:
+        from jnius import autoclass, PythonJavaClass, java_method
+
+        class _InterstitialCallback(PythonJavaClass):
+            """Callback for InterstitialAd.load()"""
+            __javainterfaces__ = [
+                "com/google/android/gms/ads/interstitial/InterstitialAdLoadCallback"
+            ]
+
+            def __init__(self, manager):
+                self.manager = manager
+                super().__init__()
+
+            @java_method("(Lcom/google/android/gms/ads/interstitial/InterstitialAd;)V")
+            def onAdLoaded(self, ad):
+                Logger.info("AdMob: Interstitial loaded")
+                self.manager.set_interstitial(ad)
+
+            @java_method("(Lcom/google/android/gms/ads/LoadAdError;)V")
+            def onAdFailedToLoad(self, error):
+                Logger.warning(f"AdMob: Interstitial failed to load")
+
+        class _FullScreenCallback(PythonJavaClass):
+            """Callback for full-screen ad events"""
+            __javainterfaces__ = [
+                "com/google/android/gms/ads/FullScreenContentCallback"
+            ]
+
+            def __init__(self, manager, on_dismissed):
+                self.manager = manager
+                self.on_dismissed = on_dismissed
+                super().__init__()
+
+            @java_method("()V")
+            def onAdDismissedFullScreenContent(self):
+                Logger.info("AdMob: Interstitial dismissed")
+                if self.on_dismissed:
+                    self.on_dismissed()
+
+            @java_method("(Lcom/google/android/gms/ads/AdError;)V")
+            def onAdFailedToShowFullScreenContent(self, error):
+                Logger.warning("AdMob: Interstitial failed to show")
+                if self.on_dismissed:
+                    self.on_dismissed()
+
+    except Exception as e:
+        Logger.error(f"AdMob: Failed to define Java callbacks — {e}")
